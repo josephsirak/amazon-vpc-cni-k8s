@@ -572,11 +572,7 @@ func (cache *EC2InstanceMetadataCache) AllocENI(useCustomCfg bool, sg []*string,
 	awsAPILatency.WithLabelValues("ModifyNetworkInterfaceAttribute", fmt.Sprint(err != nil)).Observe(msSince(start))
 	if err != nil {
 		awsAPIErrInc("ModifyNetworkInterfaceAttribute", err)
-		err := cache.FreeENI(eniID)
-		if err != nil {
-			awsUtilsErrInc("ENICleanupUponModifyNetworkErr", err)
-		}
-		return "", errors.Wrap(err, "AllocENI: unable to change the ENI's attribute")
+		log.Errorf("AllocENI: unable to change the ENI's attribute for %s: %v", eniID, err)
 	}
 
 	log.Infof("Successfully created and attached a new ENI %s to instance", eniID)
@@ -736,6 +732,7 @@ func (cache *EC2InstanceMetadataCache) FreeENI(eniName string) error {
 
 	// Retry detaching the ENI from the instance
 	var retry int
+	var detachedENI = true
 	for retry = 0; retry <= maxENIDeleteRetries; retry++ {
 		start := time.Now()
 		_, err = cache.ec2SVC.DetachNetworkInterface(detachInput)
@@ -744,7 +741,8 @@ func (cache *EC2InstanceMetadataCache) FreeENI(eniName string) error {
 			awsAPIErrInc("DetachNetworkInterface", err)
 			log.Errorf("Failed to detach ENI %s %v", eniName, err)
 			if retry == maxENIDeleteRetries {
-				return errors.New("unable to detach ENI from EC2 instance, giving up")
+				log.Errorf("FreeENI: unable to detach ENI %s from EC2 instance, giving up.", eniName)
+				detachedENI = false
 			}
 		} else {
 			log.Infof("Successfully detached ENI: %s", eniName)
@@ -759,13 +757,18 @@ func (cache *EC2InstanceMetadataCache) FreeENI(eniName string) error {
 	// retry maxENIDeleteRetries times with sleep 5 sec between to delete the interface
 	// TODO check if can use built-in waiter in the aws-sdk-go,
 	// Example: https://github.com/aws/aws-sdk-go/blob/master/service/ec2/waiters.go#L874
-	err = cache.deleteENI(eniName)
-	if err != nil {
-		awsUtilsErrInc("FreeENIDeleteErr", err)
-		return errors.Wrapf(err, "FreeENI: failed to free ENI: %s", eniName)
+	if detachedENI {
+		err = cache.deleteENI(eniName)
+		if err != nil {
+			awsUtilsErrInc("FreeENIDeleteErr", err)
+			log.Errorf("FreeENI: failed to free ENI %s: %v", eniName, err)
+		}
+
+		log.Infof("Successfully freed ENI: %s", eniName)
+	} else {
+		log.Infof("ENI %s has NOT been successfully freed.", eniName)
 	}
 
-	log.Infof("Successfully freed ENI: %s", eniName)
 	return nil
 }
 
@@ -924,7 +927,7 @@ func (cache *EC2InstanceMetadataCache) DeallocIPAddresses(eniID string, ips []st
 	if err != nil {
 		awsAPIErrInc("UnassignPrivateIpAddressesWithContext", err)
 		log.Errorf("Failed to deallocate a private IP address %v", err)
-		return errors.Wrap(err, fmt.Sprintf("deallocate IP addresses: failed to deallocate private IP addresses: %s", ips))
+		log.Info(fmt.Sprintf("deallocate IP addresses: failed to deallocate private IP addresses: %s", ips))
 	}
 	return nil
 }
